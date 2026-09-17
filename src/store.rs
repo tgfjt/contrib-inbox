@@ -1,10 +1,11 @@
-//! localStorage-backed persistence: token, login, seen markers.
+//! localStorage-backed persistence: token, login, seen markers, OAuth client_id.
 
 use std::collections::HashMap;
 
 const KEY_TOKEN: &str = "contrib-inbox.token";
 const KEY_LOGIN: &str = "contrib-inbox.login";
 const KEY_SEEN: &str = "contrib-inbox.seen";
+const KEY_CLIENT_ID: &str = "contrib-inbox.client-id";
 
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
@@ -23,6 +24,22 @@ pub fn save_token(token: &str) {
 pub fn clear_token() {
     if let Some(store) = storage() {
         let _ = store.remove_item(KEY_TOKEN);
+    }
+}
+
+pub fn clear_login() {
+    if let Some(store) = storage() {
+        let _ = store.remove_item(KEY_LOGIN);
+    }
+}
+
+pub fn load_client_id() -> Option<String> {
+    storage()?.get_item(KEY_CLIENT_ID).ok()?
+}
+
+pub fn save_client_id(client_id: &str) {
+    if let Some(store) = storage() {
+        let _ = store.set_item(KEY_CLIENT_ID, client_id);
     }
 }
 

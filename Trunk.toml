@@ -5,6 +5,12 @@ dist = "dist"
 [serve]
 port = 8080
 open = false
+# Same-origin relay for GitHub OAuth (Device Flow endpoints send no CORS
+# headers, so the PWA cannot call them directly). Browser requests to
+# /gh-oauth/* are forwarded server-side to https://github.com/*.
+[[proxy]]
+rewrite = "/gh-oauth"
+backend = "https://github.com/"
 # SharedArrayBuffer / wasm threads are not used (single-threaded build),
 # but keep cross-origin isolation on as defense-in-depth and so a future
 # multithreaded build keeps working without hosting changes.

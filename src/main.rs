@@ -3,6 +3,7 @@
 mod app;
 mod fonts;
 mod github;
+mod oauth;
 mod overlay;
 mod store;
 

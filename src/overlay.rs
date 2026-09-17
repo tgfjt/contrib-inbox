@@ -1,4 +1,4 @@
-//! DOM text overlay (token / comment input).
+//! DOM text overlay (client id / comment input).
 //!
 //! A real DOM <input>/<textarea> is used instead of a canvas text field so
 //! IME, mobile keyboards and password managers keep working. While the

@@ -7,7 +7,8 @@ use gpui::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::github::{self, CheckRuns, Comment, Item, Review, SearchResponse};
-use crate::{overlay, store};
+use crate::oauth::PollOutcome;
+use crate::{oauth, overlay, store};
 
 actions!(
     inbox,
@@ -16,7 +17,7 @@ actions!(
         Refresh,
         AddComment,
         CloseItem,
-        EditToken,
+        SignInOut,
         MoveDown,
         MoveUp,
         ShowOpen,
@@ -80,6 +81,9 @@ pub struct Inbox {
     focus: FocusHandle,
     token: Option<String>,
     login: Option<String>,
+    client_id: Option<String>,
+    auth: Option<AuthPending>,
+    auth_seq: u64,
     items: Vec<Item>,
     loading: bool,
     error: Option<String>,
@@ -89,6 +93,14 @@ pub struct Inbox {
     seen: HashMap<String, String>,
     details: HashMap<u64, Detail>,
     detail_loading: bool,
+}
+
+/// In-progress OAuth Device Flow authorization.
+#[derive(Debug, Clone)]
+struct AuthPending {
+    user_code: String,
+    verification_uri: String,
+    deadline_ms: f64,
 }
 
 /// Wall clock that works on wasm (std SystemTime panics on wasm-unknown).
@@ -102,18 +114,22 @@ impl Inbox {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let token = store::load_token().filter(|t| !t.trim().is_empty());
         let login = store::load_login().filter(|l| !l.trim().is_empty());
+        let client_id = store::load_client_id().filter(|id| !id.trim().is_empty());
         let has_token = token.is_some();
         let inbox = Self {
             focus: cx.focus_handle(),
             token,
             login,
+            client_id,
+            auth: None,
+            auth_seq: 0,
             items: Vec::new(),
             loading: false,
             error: None,
             status: if has_token {
                 String::new()
             } else {
-                "no token — press t to set a GitHub token".to_string()
+                "not signed in — press s to sign in with GitHub".to_string()
             },
             filter: Filter::Open,
             selected: 0,
@@ -154,27 +170,37 @@ impl Inbox {
             inbox.status = "signing in …".to_string();
             cx.notify();
         });
+        Self::complete_signin(this, cx, token);
+    }
+
+    /// Exchange a fresh OAuth token for a login, then refresh. Shared by
+    /// boot (stored token) and the device-flow poll loop.
+    fn complete_signin(this: &Entity<Self>, cx: &mut AsyncApp, token: String) {
         let this = this.clone();
         cx.spawn(async move |cx| {
             let login = github::get_login(&token).await;
-            let have_login = this.update(&mut *cx, |inbox, cx| {
-                match login {
-                    Ok(login) => {
-                        store::save_login(&login);
-                        inbox.login = Some(login);
-                        inbox.error = None;
-                        true
-                    }
-                    Err(message) => {
-                        inbox.error = Some(message);
-                        inbox.loading = false;
-                        inbox.status = "sign-in failed — press t to retry".to_string();
-                        cx.notify();
-                        false
-                    }
+            let ok = this.update(&mut *cx, |inbox, cx| match login {
+                Ok(login) => {
+                    store::save_token(&token);
+                    store::save_login(&login);
+                    inbox.status = format!("signed in as @{login}");
+                    inbox.token = Some(token);
+                    inbox.login = Some(login);
+                    inbox.auth = None;
+                    inbox.error = None;
+                    cx.notify();
+                    true
+                }
+                Err(message) => {
+                    inbox.error = Some(message.clone());
+                    inbox.status = format!("sign-in failed: {message} — press s to retry");
+                    inbox.auth = None;
+                    inbox.loading = false;
+                    cx.notify();
+                    false
                 }
             });
-            if have_login {
+            if ok {
                 Self::start_refresh(&this, cx);
             }
         })
@@ -270,7 +296,7 @@ impl Inbox {
             this.read_with(cx, |inbox, _| (inbox.token.clone(), inbox.login.clone()));
         let (Some(token), Some(login)) = (token, login) else {
             this.update(cx, |inbox, cx| {
-                inbox.status = "no token — press t to set a GitHub token".to_string();
+                inbox.status = "not signed in — press s to sign in with GitHub".to_string();
                 cx.notify();
             });
             return;
@@ -478,60 +504,207 @@ impl Inbox {
         .detach();
     }
 
-    pub fn start_token_editor(this: &Entity<Self>, cx: &mut AsyncApp) {
-        let initial = this.read_with(cx, |inbox, _| inbox.token.clone().unwrap_or_default());
+    /// `s` key: sign out when signed in, otherwise start OAuth Device Flow.
+    pub fn start_signin(this: &Entity<Self>, cx: &mut AsyncApp) {
+        let (token, client_id) =
+            this.read_with(cx, |inbox, _| (inbox.token.clone(), inbox.client_id.clone()));
+        if token.is_some() {
+            Self::sign_out(this, cx);
+            return;
+        }
+        match client_id.filter(|id| !id.trim().is_empty()) {
+            Some(_) => Self::begin_device_flow(this, cx),
+            None => Self::prompt_client_id(this, cx),
+        }
+    }
+
+    pub fn sign_out(this: &Entity<Self>, cx: &mut AsyncApp) {
+        store::clear_token();
+        store::clear_login();
+        this.update(cx, |inbox, cx| {
+            inbox.token = None;
+            inbox.login = None;
+            inbox.items.clear();
+            inbox.details.clear();
+            inbox.auth = None;
+            inbox.loading = false;
+            inbox.selected = 0;
+            inbox.error = None;
+            inbox.status = "signed out — press s to sign in with GitHub".to_string();
+            cx.notify();
+        });
+    }
+
+    pub fn prompt_client_id(this: &Entity<Self>, cx: &mut AsyncApp) {
+        let initial = this.read_with(cx, |inbox, _| inbox.client_id.clone().unwrap_or_default());
         let this = this.clone();
         let async_cx = cx.clone();
         overlay::open(
-            "GitHub token (classic PAT with repo scope)",
+            "GitHub OAuth App Client ID (public, no secret needed)",
             false,
             &initial,
             Box::new(move |value| {
-                let Some(token) = value else { return };
-                let token = token.trim().to_string();
+                let Some(id) = value else { return };
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return;
+                }
+                store::save_client_id(&id);
                 let this = this.clone();
-                if token.is_empty() {
-                    store::clear_token();
-                    async_cx.update(|cx| {
-                        this.update(cx, |inbox, cx| {
-                            inbox.token = None;
-                            inbox.login = None;
-                            inbox.items.clear();
-                            inbox.status =
-                                "token cleared — press t to set a GitHub token".to_string();
-                            cx.notify();
-                        });
+                let mut ac = async_cx.clone();
+                ac.update(|cx| {
+                    this.update(cx, |inbox, cx| {
+                        inbox.client_id = Some(id);
+                        inbox.error = None;
+                        cx.notify();
+                    });
+                });
+                Self::begin_device_flow(&this, &mut ac);
+            }),
+        );
+    }
+
+    pub fn cancel_auth(this: &Entity<Self>, cx: &mut AsyncApp) {
+        this.update(cx, |inbox, cx| {
+            inbox.auth_seq += 1;
+            inbox.auth = None;
+            inbox.status = "sign-in cancelled".to_string();
+            cx.notify();
+        });
+    }
+
+    /// Start OAuth Device Flow: fetch a user code, show it, poll for approval.
+    pub fn begin_device_flow(this: &Entity<Self>, cx: &mut AsyncApp) {
+        let client_id = this.read_with(cx, |inbox, _| {
+            inbox.client_id.clone().filter(|id| !id.trim().is_empty())
+        });
+        let Some(client_id) = client_id else {
+            Self::prompt_client_id(this, cx);
+            return;
+        };
+        let seq = this.update(cx, |inbox, cx| {
+            inbox.auth_seq += 1;
+            inbox.auth = None;
+            inbox.error = None;
+            inbox.status = "requesting device code …".to_string();
+            cx.notify();
+            inbox.auth_seq
+        });
+        let this = this.clone();
+        cx.spawn(async move |cx| {
+            let reply = oauth::request_device_code(&client_id).await;
+            let code = match reply {
+                Ok(code) => code,
+                Err(message) => {
+                    this.update(&mut *cx, |inbox, cx| {
+                        if inbox.auth_seq != seq {
+                            return;
+                        }
+                        inbox.error = Some(message.clone());
+                        inbox.status = format!("sign-in failed: {message}");
+                        cx.notify();
                     });
                     return;
                 }
-                async_cx
-                    .spawn(async move |cx| {
-                        let login = github::get_login(&token).await;
-                        let valid = this.update(&mut *cx, |inbox, cx| match login {
-                            Ok(login) => {
-                                store::save_token(&token);
-                                store::save_login(&login);
-                                inbox.token = Some(token);
-                                inbox.login = Some(login);
-                                inbox.error = None;
-                                inbox.status = "token saved".to_string();
-                                cx.notify();
-                                true
-                            }
-                            Err(message) => {
-                                inbox.error = Some(message.clone());
-                                inbox.status = format!("invalid token: {message}");
-                                cx.notify();
-                                false
-                            }
-                        });
-                        if valid {
-                            Self::start_refresh(&this, cx);
+            };
+            let user_code = code.user_code.clone();
+            let verification_uri = code.verification_uri.clone();
+            let device_code = code.device_code.clone();
+            let interval = code.interval.max(5);
+            let deadline_ms = js_sys::Date::now() + (code.expires_in * 1000) as f64;
+            let shown = this.update(&mut *cx, |inbox, cx| {
+                if inbox.auth_seq != seq {
+                    return false;
+                }
+                inbox.status = format!("enter {user_code} at {verification_uri}");
+                inbox.auth = Some(AuthPending {
+                    user_code: user_code.clone(),
+                    verification_uri: verification_uri.clone(),
+                    deadline_ms,
+                });
+                cx.notify();
+                true
+            });
+            if !shown {
+                return;
+            }
+            // Best-effort auto-open (popup blockers may eat it);
+            // the panel always shows a clickable link.
+            store::open_github(&verification_uri);
+            let mut wait_secs = interval;
+            loop {
+                oauth::sleep_ms((wait_secs * 1000).min(10_000) as i32).await;
+                let live = this.read_with(&*cx, |inbox, _| {
+                    inbox.auth_seq == seq
+                        && inbox
+                            .auth
+                            .as_ref()
+                            .map(|a| js_sys::Date::now() < a.deadline_ms)
+                            .unwrap_or(false)
+                });
+                if !live {
+                    this.update(&mut *cx, |inbox, cx| {
+                        if inbox.auth_seq == seq && inbox.auth.is_some() {
+                            inbox.auth = None;
+                            inbox.status =
+                                "device code expired — press s to retry".to_string();
+                            cx.notify();
                         }
-                    })
-                    .detach();
-            }),
-        );
+                    });
+                    return;
+                }
+                match oauth::poll_token(&client_id, &device_code).await {
+                    Err(message) => {
+                        this.update(&mut *cx, |inbox, cx| {
+                            if inbox.auth_seq != seq {
+                                return;
+                            }
+                            inbox.auth = None;
+                            inbox.error = Some(message.clone());
+                            inbox.status = format!("sign-in failed: {message}");
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Ok(PollOutcome::Ready(token)) => {
+                        Self::complete_signin(&this, cx, token);
+                        return;
+                    }
+                    Ok(PollOutcome::Pending) => {}
+                    Ok(PollOutcome::SlowDown) => {
+                        wait_secs += 5;
+                    }
+                    Ok(PollOutcome::Expired) => {
+                        this.update(&mut *cx, |inbox, cx| {
+                            if inbox.auth_seq != seq {
+                                return;
+                            }
+                            inbox.auth = None;
+                            inbox.status =
+                                "device code expired — press s to retry".to_string();
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Ok(PollOutcome::Denied(desc)) => {
+                        this.update(&mut *cx, |inbox, cx| {
+                            if inbox.auth_seq != seq {
+                                return;
+                            }
+                            inbox.auth = None;
+                            inbox.status = if desc.is_empty() {
+                                "authorization denied".to_string()
+                            } else {
+                                format!("authorization denied: {desc}")
+                            };
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -808,7 +981,7 @@ impl Render for Inbox {
                             .text_right()
                             .child(match &self.login {
                                 Some(login) => format!("@{login}"),
-                                None => "no login".to_string(),
+                                None => "signed out".to_string(),
                             }),
                     ),
             )
@@ -842,7 +1015,7 @@ impl Render for Inbox {
                                             .child(if self.loading {
                                                 "loading …"
                                             } else if self.token.is_none() {
-                                                "press t to set a GitHub token"
+                                                "press s to sign in with GitHub"
                                             } else {
                                                 "nothing here"
                                             })]
@@ -861,7 +1034,11 @@ impl Render for Inbox {
                             .p(px(12.0))
                             .border_r_1()
                             .border_color(rgb(BORDER))
-                            .children(render_meta(&selected, &detail)),
+                            .children(if self.token.is_none() {
+                                self.render_signin(&this)
+                            } else {
+                                render_meta(&selected, &detail)
+                            }),
                     )
                     // right: body + comments + reviews
                     .child(
@@ -887,7 +1064,7 @@ impl Render for Inbox {
                     .text_xs()
                     .child(
                         div().text_color(rgb(DIM)).child(
-                            "j/k move · enter open · r refresh · c comment · x close · t token · 1-4 filter",
+                            "j/k move · enter open · r refresh · c comment · x close · s sign in/out · 1-4 filter",
                         ),
                     )
                     .child(
@@ -904,6 +1081,157 @@ impl Render for Inbox {
                             }),
                     ),
             )
+    }
+}
+
+impl Inbox {
+    /// Middle pane while signed out: OAuth Device Flow status / entry.
+    fn render_signin(&self, this: &Entity<Self>) -> Vec<gpui::AnyElement> {
+        let mut rows: Vec<gpui::AnyElement> = vec![
+            div()
+                .text_base()
+                .text_color(rgb(TEXT))
+                .child("Sign in with GitHub")
+                .into_any_element(),
+            div()
+                .mt(px(6.0))
+                .text_sm()
+                .text_color(rgb(DIM))
+                .child("OAuth Device Flow — approve in your browser, no secrets typed here.")
+                .into_any_element(),
+        ];
+        match &self.client_id {
+            Some(id) => {
+                let masked: String = id.chars().take(4).collect();
+                let handler = this.clone();
+                rows.push(
+                    div()
+                        .mt(px(6.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .text_xs()
+                        .child(
+                            div()
+                                .mr(px(8.0))
+                                .text_color(rgb(DIM))
+                                .child(format!("client_id: {masked}…")),
+                        )
+                        .child(
+                            div()
+                                .id("change-client-id")
+                                .text_color(rgb(ACCENT))
+                                .child("change")
+                                .on_click(move |_, _, cx| {
+                                    let handler = handler.clone();
+                                    cx.spawn(async move |cx| {
+                                        Self::prompt_client_id(&handler, cx);
+                                    })
+                                    .detach();
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            None => {
+                rows.push(
+                    div()
+                        .mt(px(6.0))
+                        .text_xs()
+                        .text_color(rgb(YELLOW))
+                        .child("no OAuth App client_id yet — press s")
+                        .into_any_element(),
+                );
+            }
+        }
+        match &self.auth {
+            Some(auth) => {
+                let uri = auth.verification_uri.clone();
+                let cancel = this.clone();
+                rows.push(
+                    div()
+                        .mt(px(10.0))
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .child("enter this code at")
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(2.0))
+                        .text_lg()
+                        .text_color(rgb(ACCENT))
+                        .child(auth.user_code.clone())
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(2.0))
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child(auth.verification_uri.clone())
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(8.0))
+                        .flex()
+                        .flex_row()
+                        .text_sm()
+                        .child(
+                            div()
+                                .id("open-verify")
+                                .mr(px(12.0))
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded_md()
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(BG))
+                                .child("open verification page")
+                                .on_click(move |_, _, _| {
+                                    store::open_github(&uri);
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("cancel-auth")
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded_md()
+                                .bg(rgb(PANEL))
+                                .text_color(rgb(DIM))
+                                .child("cancel")
+                                .on_click(move |_, _, cx| {
+                                    let cancel = cancel.clone();
+                                    cx.spawn(async move |cx| {
+                                        Self::cancel_auth(&cancel, cx);
+                                    })
+                                    .detach();
+                                }),
+                        )
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(8.0))
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .child("waiting for approval …")
+                        .into_any_element(),
+                );
+            }
+            None => {
+                rows.push(
+                    div()
+                        .mt(px(10.0))
+                        .text_sm()
+                        .text_color(rgb(DIM))
+                        .child("press s to get a one-time code")
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
     }
 }
 
@@ -1197,7 +1525,7 @@ pub fn bind_keys(inbox: &Entity<Inbox>, cx: &mut App) {
         KeyBinding::new("r", Refresh, None),
         KeyBinding::new("c", AddComment, None),
         KeyBinding::new("x", CloseItem, None),
-        KeyBinding::new("t", EditToken, None),
+        KeyBinding::new("s", SignInOut, None),
         KeyBinding::new("j", MoveDown, None),
         KeyBinding::new("down", MoveDown, None),
         KeyBinding::new("k", MoveUp, None),
@@ -1262,13 +1590,13 @@ pub fn bind_keys(inbox: &Entity<Inbox>, cx: &mut App) {
     });
     cx.on_action({
         let inbox = inbox.clone();
-        move |_: &EditToken, cx: &mut App| {
+        move |_: &SignInOut, cx: &mut App| {
             if inapplicable() {
                 return;
             }
             let inbox = inbox.clone();
             cx.spawn(async move |cx| {
-                Inbox::start_token_editor(&inbox, cx);
+                Inbox::start_signin(&inbox, cx);
             }).detach();
         }
     });

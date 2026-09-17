@@ -1,5 +1,6 @@
 // contrib-inbox service worker: app-shell offline, API always network.
-const VERSION = "v0.1.0";
+// Bump VERSION on every shipped UI change so clients drop the old shell.
+const VERSION = "v0.2.0";
 const SHELL = "inbox-shell-" + VERSION;
 
 self.addEventListener("install", (event) => {

@@ -16,6 +16,13 @@ use web_sys::{Request, RequestInit, Response};
 /// Same-origin relay prefix (see Trunk.toml `[[proxy]]`).
 pub const OAUTH_BASE: &str = "/gh-oauth";
 
+/// Callback URL for the web flow, derived from the current origin so any
+/// trunk port works (register each origin in the OAuth App settings).
+pub fn redirect_uri() -> Option<String> {
+    let origin = web_sys::window()?.location().origin().ok()?;
+    Some(format!("{origin}/auth/callback"))
+}
+
 /// Requested scopes for the OAuth App token.
 const SCOPE: &str = "repo";
 
@@ -57,10 +64,6 @@ fn enc(text: &str) -> String {
     js_sys::encode_uri_component(text)
         .as_string()
         .unwrap_or_else(|| text.to_string())
-}
-
-pub(crate) fn enc_param(text: &str) -> String {
-    enc(text)
 }
 
 /// Random hex string (CSRF state / PKCE verifier material).

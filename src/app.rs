@@ -110,6 +110,14 @@ fn now_utc() -> OffsetDateTime {
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
+/// What to do after an OAuth App Client ID is entered.
+#[derive(Clone, Copy)]
+enum AfterId {
+    Web,
+    Device,
+    Nothing,
+}
+
 impl Inbox {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let token = store::load_token().filter(|t| !t.trim().is_empty());
@@ -156,6 +164,9 @@ impl Inbox {
 
     /// Kick off login + first refresh. Call once from outside any update.
     pub fn boot(this: &Entity<Self>, cx: &mut AsyncApp) {
+        if Self::take_oauth_callback(this, cx) {
+            return;
+        }
         let (token, login) =
             this.read_with(cx, |inbox, _| (inbox.token.clone(), inbox.login.clone()));
         let Some(token) = token else {
@@ -171,6 +182,143 @@ impl Inbox {
             cx.notify();
         });
         Self::complete_signin(this, cx, token);
+    }
+
+    /// Handle a GitHub web-flow redirect (`/auth/callback?code=&state=`).
+    /// Returns true when a callback was present.
+    fn take_oauth_callback(this: &Entity<Self>, cx: &mut AsyncApp) -> bool {
+        let window = match web_sys::window() {
+            Some(window) => window,
+            None => return false,
+        };
+        let query = window.location().search().unwrap_or_default();
+        if query.is_empty() {
+            return false;
+        }
+        let params = match web_sys::UrlSearchParams::new_with_str(&query) {
+            Ok(params) => params,
+            Err(_) => return false,
+        };
+        let (Some(code), Some(state)) = (params.get("code"), params.get("state")) else {
+            return false;
+        };
+        // Clean the URL so a reload never re-processes the code.
+        if let Ok(history) = window.history() {
+            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some("/"));
+        }
+        let saved = store::take_oauth_state();
+        let Some((saved_state, verifier)) = saved else {
+            Self::callback_failed(this, cx, "stale callback (state gone) — press s to retry");
+            return true;
+        };
+        if saved_state != state {
+            Self::callback_failed(this, cx, "state mismatch — press s to retry");
+            return true;
+        }
+        let client_id = this
+            .read_with(cx, |inbox, _| inbox.client_id.clone())
+            .unwrap_or_default();
+        let Some(redirect) = oauth::redirect_uri() else {
+            Self::callback_failed(this, cx, "cannot determine redirect_uri");
+            return true;
+        };
+        this.update(cx, |inbox, cx| {
+            inbox.loading = true;
+            inbox.status = "exchanging code …".to_string();
+            cx.notify();
+        });
+        let this = this.clone();
+        cx.spawn(async move |cx| {
+            Self::exchange_and_signin(&this, cx, &client_id, &code, &redirect, &verifier);
+        })
+        .detach();
+        true
+    }
+
+    fn callback_failed(this: &Entity<Self>, cx: &mut AsyncApp, message: &str) {
+        let message = message.to_string();
+        this.update(cx, |inbox, cx| {
+            inbox.error = Some(message.clone());
+            inbox.status = format!("sign-in failed: {message}");
+            cx.notify();
+        });
+    }
+
+    /// Exchange a web-flow code (adaptive client_secret), then sign in.
+    fn exchange_and_signin(
+        this: &Entity<Self>,
+        cx: &mut AsyncApp,
+        client_id: &str,
+        code: &str,
+        redirect: &str,
+        verifier: &str,
+    ) {
+        let secret = store::load_client_secret().filter(|s| !s.trim().is_empty());
+        let (client_id, code, redirect, verifier) = (
+            client_id.to_string(),
+            code.to_string(),
+            redirect.to_string(),
+            verifier.to_string(),
+        );
+        let this = this.clone();
+        cx.spawn(async move |cx| {
+            let result =
+                oauth::exchange_code(&client_id, &code, &redirect, &verifier, secret.as_deref())
+                    .await;
+            match result {
+                Ok(token) => Self::complete_signin(&this, cx, token),
+                Err(message) if message.starts_with("incorrect_client_credentials") && secret.is_none() => {
+                    Self::prompt_client_secret(&this, cx, client_id, code, redirect, verifier)
+                }
+                Err(message) => {
+                    let message = message.clone();
+                    this.update(&mut *cx, |inbox, cx| {
+                        inbox.auth = None;
+                        inbox.loading = false;
+                        inbox.error = Some(message.clone());
+                        inbox.status = format!("sign-in failed: {message}");
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn prompt_client_secret(
+        this: &Entity<Self>,
+        cx: &mut AsyncApp,
+        client_id: String,
+        code: String,
+        redirect: String,
+        verifier: String,
+    ) {
+        let this = this.clone();
+        let async_cx = cx.clone();
+        overlay::open(
+            "OAuth App Client Secret (GitHub demands it — stored locally)",
+            false,
+            "",
+            Box::new(move |value| {
+                let Some(secret) = value else { return };
+                let secret = secret.trim().to_string();
+                if secret.is_empty() {
+                    return;
+                }
+                store::save_client_secret(&secret);
+                let this = this.clone();
+                let async_cx = async_cx.clone();
+                let args = (client_id.clone(), code.clone(), redirect.clone(), verifier.clone());
+                async_cx
+                    .spawn(async move |cx| {
+                        let (client_id, code, redirect, verifier) = args;
+                        Self::exchange_and_signin(
+                            &this, cx, &client_id, &code, &redirect, &verifier,
+                        );
+                    })
+                    .detach();
+            }),
+        );
     }
 
     /// Exchange a fresh OAuth token for a login, then refresh. Shared by
@@ -504,7 +652,7 @@ impl Inbox {
         .detach();
     }
 
-    /// `s` key: sign out when signed in, otherwise start OAuth Device Flow.
+    /// `s` key: sign out when signed in, otherwise start web-flow sign in.
     pub fn start_signin(this: &Entity<Self>, cx: &mut AsyncApp) {
         let (token, client_id) =
             this.read_with(cx, |inbox, _| (inbox.token.clone(), inbox.client_id.clone()));
@@ -513,8 +661,8 @@ impl Inbox {
             return;
         }
         match client_id.filter(|id| !id.trim().is_empty()) {
-            Some(_) => Self::begin_device_flow(this, cx),
-            None => Self::prompt_client_id(this, cx),
+            Some(_) => Self::start_web_signin(this, cx),
+            None => Self::prompt_client_id(this, cx, AfterId::Web),
         }
     }
 
@@ -535,7 +683,34 @@ impl Inbox {
         });
     }
 
-    pub fn prompt_client_id(this: &Entity<Self>, cx: &mut AsyncApp) {
+    /// Web flow step 1: save CSRF state + PKCE verifier, navigate to GitHub.
+    /// GitHub redirects back to `<origin>/auth/callback?code=&state=`.
+    pub fn start_web_signin(this: &Entity<Self>, cx: &mut AsyncApp) {
+        let client_id = this.read_with(cx, |inbox, _| {
+            inbox.client_id.clone().filter(|id| !id.trim().is_empty())
+        });
+        let Some(client_id) = client_id else {
+            Self::prompt_client_id(this, cx, AfterId::Web);
+            return;
+        };
+        let Some(redirect) = oauth::redirect_uri() else {
+            this.update(cx, |inbox, cx| {
+                inbox.error = Some("cannot determine origin for redirect_uri".to_string());
+                cx.notify();
+            });
+            return;
+        };
+        let state = oauth::random_hex(16);
+        let verifier = oauth::random_hex(32);
+        let challenge = oauth::pkce_challenge(&verifier);
+        store::save_oauth_state(&state, &verifier);
+        let url = oauth::authorize_url(&client_id, &redirect, &state, &challenge);
+        if let Some(window) = web_sys::window() {
+            let _ = window.location().set_href(&url);
+        }
+    }
+
+    fn prompt_client_id(this: &Entity<Self>, cx: &mut AsyncApp, after: AfterId) {
         let initial = this.read_with(cx, |inbox, _| inbox.client_id.clone().unwrap_or_default());
         let this = this.clone();
         let async_cx = cx.clone();
@@ -559,7 +734,11 @@ impl Inbox {
                         cx.notify();
                     });
                 });
-                Self::begin_device_flow(&this, &mut ac);
+                match after {
+                    AfterId::Web => Self::start_web_signin(&this, &mut ac),
+                    AfterId::Device => Self::begin_device_flow(&this, &mut ac),
+                    AfterId::Nothing => {}
+                }
             }),
         );
     }
@@ -579,7 +758,7 @@ impl Inbox {
             inbox.client_id.clone().filter(|id| !id.trim().is_empty())
         });
         let Some(client_id) = client_id else {
-            Self::prompt_client_id(this, cx);
+            Self::prompt_client_id(this, cx, AfterId::Device);
             return;
         };
         let seq = this.update(cx, |inbox, cx| {
@@ -1097,9 +1276,35 @@ impl Inbox {
                 .mt(px(6.0))
                 .text_sm()
                 .text_color(rgb(DIM))
-                .child("OAuth Device Flow — approve in your browser, no secrets typed here.")
+                .child("Approve in your browser — no secrets typed here.")
                 .into_any_element(),
         ];
+        {
+            let handler = this.clone();
+            rows.push(
+                div()
+                    .mt(px(10.0))
+                    .child(
+                        div()
+                            .id("signin-web")
+                            .px(px(14.0))
+                            .py(px(6.0))
+                            .rounded_md()
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(BG))
+                            .text_sm()
+                            .child("Sign in with GitHub")
+                            .on_click(move |_, _, cx| {
+                                let handler = handler.clone();
+                                cx.spawn(async move |cx| {
+                                    Self::start_web_signin(&handler, cx);
+                                })
+                                .detach();
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
         match &self.client_id {
             Some(id) => {
                 let masked: String = id.chars().take(4).collect();
@@ -1125,7 +1330,7 @@ impl Inbox {
                                 .on_click(move |_, _, cx| {
                                     let handler = handler.clone();
                                     cx.spawn(async move |cx| {
-                                        Self::prompt_client_id(&handler, cx);
+                                        Self::prompt_client_id(&handler, cx, AfterId::Nothing);
                                     })
                                     .detach();
                                 }),
@@ -1221,12 +1426,24 @@ impl Inbox {
                 );
             }
             None => {
+                let handler = this.clone();
                 rows.push(
                     div()
                         .mt(px(10.0))
                         .text_sm()
-                        .text_color(rgb(DIM))
-                        .child("press s to get a one-time code")
+                        .child(
+                            div()
+                                .id("device-link")
+                                .text_color(rgb(ACCENT))
+                                .child("or use a device code instead")
+                                .on_click(move |_, _, cx| {
+                                    let handler = handler.clone();
+                                    cx.spawn(async move |cx| {
+                                        Self::begin_device_flow(&handler, cx);
+                                    })
+                                    .detach();
+                                }),
+                        )
                         .into_any_element(),
                 );
             }

@@ -6,6 +6,8 @@ const KEY_TOKEN: &str = "contrib-inbox.token";
 const KEY_LOGIN: &str = "contrib-inbox.login";
 const KEY_SEEN: &str = "contrib-inbox.seen";
 const KEY_CLIENT_ID: &str = "contrib-inbox.client-id";
+const KEY_CLIENT_SECRET: &str = "contrib-inbox.client-secret";
+const KEY_OAUTH_STATE: &str = "contrib-inbox.oauth-state";
 
 fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
@@ -41,6 +43,35 @@ pub fn save_client_id(client_id: &str) {
     if let Some(store) = storage() {
         let _ = store.set_item(KEY_CLIENT_ID, client_id);
     }
+}
+
+pub fn load_client_secret() -> Option<String> {
+    storage()?.get_item(KEY_CLIENT_SECRET).ok()?
+}
+
+pub fn save_client_secret(secret: &str) {
+    if let Some(store) = storage() {
+        let _ = store.set_item(KEY_CLIENT_SECRET, secret);
+    }
+}
+
+/// Pending web-flow login: CSRF state + PKCE verifier, saved before redirect.
+pub fn save_oauth_state(state: &str, verifier: &str) {
+    if let Some(store) = storage() {
+        let value = serde_json::json!({"state": state, "verifier": verifier}).to_string();
+        let _ = store.set_item(KEY_OAUTH_STATE, &value);
+    }
+}
+
+pub fn take_oauth_state() -> Option<(String, String)> {
+    let store = storage()?;
+    let text = store.get_item(KEY_OAUTH_STATE).ok()??;
+    let _ = store.remove_item(KEY_OAUTH_STATE);
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((
+        value.get("state")?.as_str()?.to_string(),
+        value.get("verifier")?.as_str()?.to_string(),
+    ))
 }
 
 pub fn load_login() -> Option<String> {

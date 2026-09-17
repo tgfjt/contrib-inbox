@@ -7,6 +7,7 @@
 //! Device Flow needs no client_secret — only the public OAuth App client_id.
 
 use serde::Deserialize;
+use base64::Engine as _;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
@@ -56,6 +57,74 @@ fn enc(text: &str) -> String {
     js_sys::encode_uri_component(text)
         .as_string()
         .unwrap_or_else(|| text.to_string())
+}
+
+pub(crate) fn enc_param(text: &str) -> String {
+    enc(text)
+}
+
+/// Random hex string (CSRF state / PKCE verifier material).
+pub fn random_hex(bytes: usize) -> String {
+    (0..bytes)
+        .map(|_| format!("{:02x}", (js_sys::Math::random() * 256.0) as u8))
+        .collect()
+}
+
+/// PKCE S256 challenge for a verifier.
+pub fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Step 1 of the web flow: URL to navigate the browser to.
+pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str, challenge: &str) -> String {
+    format!(
+        "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        enc(client_id),
+        enc(redirect_uri),
+        enc(SCOPE),
+        enc(state),
+        enc(challenge),
+    )
+}
+
+/// Step 2 of the web flow: exchange `code` for a token.
+/// Tries PKCE-only first; pass the client_secret if GitHub demands it.
+pub async fn exchange_code(
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    secret: Option<&str>,
+) -> Result<String, String> {
+    let mut params: Vec<(String, String)> = vec![
+        ("client_id".to_string(), client_id.to_string()),
+        ("code".to_string(), code.to_string()),
+        ("redirect_uri".to_string(), redirect_uri.to_string()),
+        ("code_verifier".to_string(), verifier.to_string()),
+    ];
+    if let Some(secret) = secret.filter(|s| !s.trim().is_empty()) {
+        params.push(("client_secret".to_string(), secret.to_string()));
+    }
+    let body = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", enc(key), enc(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let text = post_form("/login/oauth/access_token", &body).await?;
+    let reply: TokenReply =
+        serde_json::from_str(&text).map_err(|e| format!("decode token: {e}"))?;
+    if let Some(token) = reply.access_token {
+        return Ok(token);
+    }
+    let error = reply.error.unwrap_or_else(|| "exchange_failed".to_string());
+    let desc = reply.error_description.unwrap_or_default();
+    Err(if desc.is_empty() {
+        error
+    } else {
+        format!("{error}: {desc}")
+    })
 }
 
 fn form(params: &[(&str, &str)]) -> String {

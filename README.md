@@ -16,26 +16,30 @@ trunk serve
 Production build: `trunk build --release`. Needs the stable toolchain with the
 wasm target (`rust-toolchain.toml` pins it).
 
-## Sign in (OAuth Device Flow)
+## Sign in (OAuth, no tokens typed)
 
-No tokens are typed anywhere. GitHub's OAuth endpoints send no CORS headers,
-so the PWA cannot call them directly — `trunk serve` relays same-origin
-`/gh-oauth/*` → `https://github.com/*` (see `[[proxy]]` in `Trunk.toml`).
-Device Flow needs no `client_secret`, only the public OAuth App client_id.
+GitHub's OAuth endpoints send no CORS headers, so the PWA cannot call them
+directly — `trunk serve` relays same-origin `/gh-oauth/*` → `https://github.com/*`
+(see `[[proxy]]` in `Trunk.toml`).
 
 One-time setup (2 min):
 
 1. github.com → Settings → Developer settings → OAuth Apps → New OAuth App.
-   Name/homepage can be anything local (e.g. `http://127.0.0.1:8080`);
-   the callback URL field is required but unused by Device Flow.
-2. Check **Enable Device Flow**, create, copy the **Client ID**
-   (the secret is never needed).
-3. In the app press `s`, paste the Client ID (stored in `localStorage`).
-   The app shows a one-time code — enter it at `github.com/login/device`
-   (a tab opens automatically; a clickable link is also shown).
+   Homepage URL can be anything local; add an **Authorization callback URL**
+   exactly matching your serve origin, e.g.
+   `http://127.0.0.1:8080/auth/callback` (use `127.0.0.1`, not `localhost`;
+   add one entry per port you serve on). Device Flow is not needed.
+2. Copy the **Client ID** (and keep the Client Secret at hand — most likely
+   unneeded).
+3. In the app press `s` or the **Sign in with GitHub** button, paste the
+   Client ID (stored in `localStorage`). The browser opens GitHub — approve,
+   and the app signs itself in via PKCE (`S256`, no secret sent) through the
+   relay. If GitHub insists on `incorrect_client_credentials`, the app asks
+   for the Client Secret once and retries (also stored in `localStorage`).
 
 The issued token (scope `repo`) is stored in `localStorage` and sent only to
-`api.github.com`. `s` again signs out.
+`api.github.com`. `s` again signs out. A device-code flow remains as a
+fallback link in the sign-in panel.
 
 ## Keys
 

@@ -1,0 +1,16 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[serve]
+port = 8080
+open = false
+# SharedArrayBuffer / wasm threads are not used (single-threaded build),
+# but keep cross-origin isolation on as defense-in-depth and so a future
+# multithreaded build keeps working without hosting changes.
+[serve.headers]
+Cross-Origin-Opener-Policy = "same-origin"
+Cross-Origin-Embedder-Policy = "require-corp"
+
+[watch]
+ignore = ["dist", "target"]

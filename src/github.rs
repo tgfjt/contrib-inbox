@@ -34,6 +34,7 @@ pub struct PullRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Item {
     pub id: u64,
     pub number: u64,
@@ -56,6 +57,7 @@ pub struct Item {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Comment {
     pub id: u64,
     pub body: Option<String>,
@@ -65,6 +67,7 @@ pub struct Comment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Review {
     pub id: u64,
     pub state: String,
@@ -74,6 +77,7 @@ pub struct Review {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct PrDetail {
     pub head: PrHead,
     #[serde(default)]
@@ -92,6 +96,7 @@ pub struct CheckRuns {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CheckRun {
     pub name: String,
     pub status: String,

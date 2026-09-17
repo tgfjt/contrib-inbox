@@ -19,10 +19,18 @@ fn run() {
             if !fonts::load_fonts(cx) {
                 return;
             }
-            cx.open_window(WindowOptions::default(), |_, cx| {
-                cx.new(|_| app::InboxRoot::new())
-            })
-            .unwrap();
+            let window = cx
+                .open_window(WindowOptions::default(), |_, cx| {
+                    cx.new(|cx| app::Inbox::new(cx))
+                })
+                .unwrap();
+            let inbox = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+            app::bind_keys(&inbox, cx);
+            window
+                .update(cx, |view, window, cx| {
+                    window.focus(&view.focus_handle(cx), cx);
+                })
+                .unwrap();
         });
 }
 
@@ -31,5 +39,18 @@ fn run() {
 pub fn start() {
     console_error_panic_hook::set_once();
     gpui_web::init_logging();
+    register_service_worker();
     run();
+}
+
+#[cfg(target_family = "wasm")]
+fn register_service_worker() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let container = window.navigator().service_worker();
+    let promise = container.register("/sw.js");
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    });
 }

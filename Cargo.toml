@@ -17,6 +17,10 @@ web-sys = { version = "0.3", features = [
     "ServiceWorkerContainer",
     "ServiceWorkerRegistration",
     "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "KeyboardEvent",
 ] }
 js-sys = "0.3"
 serde = { version = "1", features = ["derive"] }

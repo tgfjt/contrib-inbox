@@ -2,6 +2,9 @@
 
 mod app;
 mod fonts;
+mod github;
+mod overlay;
+mod store;
 
 use std::rc::Rc;
 

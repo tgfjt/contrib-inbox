@@ -715,7 +715,7 @@ impl Inbox {
         let this = this.clone();
         let async_cx = cx.clone();
         overlay::open(
-            "GitHub OAuth App Client ID (public, no secret needed)",
+            "GitHub OAuth App Client ID (step 2 — shown on your app page)",
             false,
             &initial,
             Box::new(move |value| {
@@ -1339,12 +1339,59 @@ impl Inbox {
                 );
             }
             None => {
+                let callback = oauth::redirect_uri()
+                    .unwrap_or_else(|| "http://127.0.0.1:8080/auth/callback".to_string());
+                rows.push(
+                    div()
+                        .mt(px(10.0))
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child("1. Create an OAuth App")
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(4.0))
+                        .child(
+                            div()
+                                .id("open-app-settings")
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded_md()
+                                .bg(rgb(PANEL))
+                                .text_color(rgb(ACCENT))
+                                .text_sm()
+                                .child("open github.com/settings/applications/new")
+                                .on_click(move |_, _, _| {
+                                    store::open_github(
+                                        "https://github.com/settings/applications/new",
+                                    );
+                                }),
+                        )
+                        .into_any_element(),
+                );
                 rows.push(
                     div()
                         .mt(px(6.0))
                         .text_xs()
+                        .text_color(rgb(DIM))
+                        .child("register this callback URL exactly:")
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(2.0))
+                        .text_sm()
                         .text_color(rgb(YELLOW))
-                        .child("no OAuth App client_id yet — press s")
+                        .child(callback)
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(8.0))
+                        .text_sm()
+                        .text_color(rgb(TEXT))
+                        .child("2. Press the button above, paste the Client ID")
                         .into_any_element(),
                 );
             }

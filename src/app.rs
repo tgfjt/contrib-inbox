@@ -122,7 +122,14 @@ impl Inbox {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let token = store::load_token().filter(|t| !t.trim().is_empty());
         let login = store::load_login().filter(|l| !l.trim().is_empty());
-        let client_id = store::load_client_id().filter(|id| !id.trim().is_empty());
+        // App configuration first, explicit UI entry wins over build env.
+        let client_id = store::load_client_id()
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| {
+                option_env!("CONTRIB_INBOX_CLIENT_ID")
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+            });
         let has_token = token.is_some();
         let inbox = Self {
             focus: cx.focus_handle(),
@@ -1391,7 +1398,15 @@ impl Inbox {
                         .mt(px(8.0))
                         .text_sm()
                         .text_color(rgb(TEXT))
-                        .child("2. Press the button above, paste the Client ID")
+                        .child("2. Set CONTRIB_INBOX_CLIENT_ID=… and restart serve")
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .mt(px(2.0))
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .child("or press the button above and paste the ID")
                         .into_any_element(),
                 );
             }

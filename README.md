@@ -31,11 +31,15 @@ One-time setup (2 min):
    add one entry per port you serve on). Device Flow is not needed.
 2. Copy the **Client ID** (and keep the Client Secret at hand — most likely
    unneeded).
-3. In the app press `s` or the **Sign in with GitHub** button, paste the
-   Client ID (stored in `localStorage`). The browser opens GitHub — approve,
-   and the app signs itself in via PKCE (`S256`, no secret sent) through the
-   relay. If GitHub insists on `incorrect_client_credentials`, the app asks
-   for the Client Secret once and retries (also stored in `localStorage`).
+3. Give the app the Client ID via build env (recommended — it's public):
+   `CONTRIB_INBOX_CLIENT_ID=xxx trunk serve`.
+   Alternative: press `s` in the app and paste it (stored in `localStorage`,
+   overrides env; changeable from the panel).
+4. Press the **Sign in with GitHub** button, approve on GitHub — the app
+   signs itself in via PKCE (`S256`, no secret sent) through the relay.
+   If GitHub insists on `incorrect_client_credentials`, the app asks for
+   the Client Secret once and retries (also stored in `localStorage`;
+   deliberately never baked into the build).
 
 The issued token (scope `repo`) is stored in `localStorage` and sent only to
 `api.github.com`. `s` again signs out. A device-code flow remains as a
